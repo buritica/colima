@@ -1,0 +1,107 @@
+# Investigation: lima 2.x zombie containers on virtiofs
+
+Tracking work for https://github.com/abiosoft/colima/issues/1552.
+
+## Symptom
+
+On a macOS 26.5 M1 with `colima 0.10.1` + `lima 2.1.1`, container processes
+that do I/O against an NFS-backed virtiofs bind mount enter uninterruptible
+D-state and cannot be killed with SIGKILL. `docker stop`, `docker restart`,
+`docker rm -f`, and `docker compose down` all hang for 12s per container with:
+
+```
+cannot kill container: <id> PID <pid> is zombie and can not be killed.
+Use the --init option when creating containers to run an init inside the
+container that forwards signals and reaps processes
+```
+
+Only recovery is force-restarting the Colima VM (`colima stop -f` → kill
+leftover limactl processes → `rm` stale `ha.pid`/`vz.pid`/sockets → `colima
+start`). See `../halfmoon/scripts/colima_healthcheck.sh` for the playbook.
+
+Downgrading to `colima 0.9.1 + lima 1.2.3` fixes it entirely.
+
+## Reproduction attempts
+
+### On crowntail (the machine the user is reading this from)
+
+- macOS 26.4, M1
+- colima 0.10.1, lima 2.1.0
+- Test profile: `colima start --profile zombie-repro --vm-type vz --mount-type virtiofs --mount /tmp/zombie-test:w`
+- Ran 10 concurrent containers each doing `dd if=/dev/urandom of=/data/f... bs=4k count=100` in a loop
+- Killed all 10 simultaneously with `docker kill`
+- **Result**: total kill time 0.4s, zero zombies, all clean
+
+Local-path virtiofs (APFS-backed `/tmp`) does not reproduce the bug, even
+under heavy concurrent write I/O.
+
+### On halfmoon (the reporter)
+
+- macOS 26.5, M1, colima 0.10.1, lima 2.1.1
+- NFS bind mount from QNAP NAS (`plakatz:/Media`)
+- NFS share has directories mode `0770 owner=1000:100` that container users
+  (root via root_squash, or `abc` uid=501 without supplementary gid=100) can
+  NOT access → NFS RPC returns EACCES, but under some conditions blocks
+- Zombie containers appeared within 30–60 minutes of normal arr-stack usage
+- 100% reproducible across multiple reboots
+
+## Hypothesis
+
+The zombie trap needs:
+1. A syscall path that enters `TASK_UNINTERRUPTIBLE` (D-state) in the guest
+   kernel inside the VM
+2. A way for that state to persist long enough that SIGKILL can't be honored
+
+Virtiofs on its own does not trap processes in D-state for local-disk-backed
+paths — D-state is brief because the host I/O completes quickly.
+
+When the host path is itself a slow/flaky network filesystem (NFS with
+retries, `hard` mount, failing RPCs), the virtiofs driver in the guest
+waits on a host-side read/stat/access that takes seconds to minutes to
+return. Processes accessing that path stack up in D-state, and a SIGKILL
+arriving during that window gets queued but never delivered, so the
+container process becomes a "zombie and can not be killed" until the
+underlying NFS RPC finally resolves.
+
+Why lima 2.x makes it worse than lima 1.x: unknown. Hypotheses:
+- virtiofs mount options (cache mode, tiered i/o config) changed defaults
+- VM kernel image shipped with lima 2.x handles D-state scheduling differently
+- VZ framework integration path changed (lima 2.0 reorganized VM drivers as
+  plugins — the internal contract between lima and Apple's VZ.framework
+  could have changed)
+
+## Tests added in this branch
+
+`environment/vm/lima/yaml_vz_test.go` — documents the generated lima.yaml
+schema shape (specifically that Rosetta lives under `vmOpts.vz.rosetta`,
+NOT at top-level). This catches the schema mismatch that prevents
+downgrading lima without downgrading colima.
+
+It does NOT catch the zombie bug — that lives inside the guest kernel's
+interaction with virtiofs-backed syscalls. A meaningful regression test
+would require either:
+
+1. A Linux CI runner with a mockable slow-filesystem (FUSE) backing
+   virtiofs, and a container workload that stresses it.
+2. A macOS CI runner with VZ+virtiofs and a way to simulate blocked host
+   I/O (an NFS mount to an unreachable host, a paused FUSE server, etc.).
+
+Neither is simple to wire into colima's existing CI (`go.yml` runs on
+ubuntu-latest + macos-15-intel). The VZ driver requires Apple Silicon
+macOS 13+, so the existing CI can't even exercise the vz code path.
+
+## Open questions for upstream
+
+1. Did lima 2.x intentionally change virtiofs default mount options?
+2. Should colima expose virtiofs mount options (cache mode, writeback, etc.)
+   through its `Mount` struct, paralleling the existing `NineP` options?
+3. Is there a known-good colima release matched to lima 2.x?
+
+## Workaround (current)
+
+Pin `colima` and `lima` to the last-known-good combo:
+
+```bash
+brew pin colima  # pin 0.9.1
+brew pin lima    # pin 1.2.3
+```
