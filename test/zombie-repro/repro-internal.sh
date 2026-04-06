@@ -165,8 +165,10 @@ TOTAL=$((END_TIME - START_TIME))
 echo ""
 echo "================================="
 echo "Versions:"
-colima version 2>&1 | head -2
-limactl --version 2>&1
+# Avoid pipefail + SIGPIPE: capture full output then trim
+COLIMA_VER="$(colima version 2>&1 || true)"
+echo "$COLIMA_VER" | head -2
+limactl --version 2>&1 || true
 echo "================================="
 
 if [ "$ZOMBIE_COUNT" -gt 0 ]; then
