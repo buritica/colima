@@ -21,12 +21,11 @@ NUM_CONTAINERS=5
 KILL_TIMEOUT=15
 NFS_MOUNT="/tmp/zombie-nfs-mount"
 USE_SLOW=false
-NFS_PORT=2049  # default: direct to NFS server
 
 # Parse flags
 for arg in "$@"; do
   case "$arg" in
-    --slow) USE_SLOW=true; NFS_PORT=2050 ;;
+    --slow) USE_SLOW=true ;;
     --containers=*) NUM_CONTAINERS="${arg#*=}" ;;
     --timeout=*) KILL_TIMEOUT="${arg#*=}" ;;
   esac
@@ -71,13 +70,12 @@ if ! docker ps --filter name=zombie-nfs --format '{{.State}}' 2>/dev/null | grep
 fi
 
 if [ "$USE_SLOW" = true ]; then
-  if ! docker ps --filter name=zombie-nfs-delay --format '{{.State}}' 2>/dev/null | grep -q running; then
-    fail "Slow proxy not running. Run: docker compose --profile slow up -d"
-    fail "Or set NFS_DELAY_MS=500 NFS_LOSS_PCT=10 docker compose --profile slow up -d"
-    exit 1
-  fi
-  log "Using SLOW mode: NFS traffic goes through tc netem proxy (port $NFS_PORT)"
-  docker logs zombie-nfs-delay 2>&1 | grep -E 'Adding|Starting' | tail -2
+  log "Using SLOW mode: will apply tc netem to NFS server after mount"
+  log "  delay=${NFS_DELAY_MS}ms jitter=${NFS_JITTER_MS}ms loss=${NFS_LOSS_PCT}%"
+  # Ensure iproute2 is installed in the NFS container for tc netem.
+  docker context use colima >/dev/null 2>&1
+  docker exec zombie-nfs sh -c 'which tc >/dev/null 2>&1 || apk add --no-cache iproute2 >/dev/null 2>&1' || true
+  docker context use "colima-$PROFILE" >/dev/null 2>&1 || true
 fi
 
 # Get the colima VM's IP (reachable from inside VZ test profile via host network)
@@ -100,19 +98,11 @@ mkdir -p "$NFS_MOUNT"
 if mount | grep -qF "$NFS_MOUNT"; then
   warn "Already mounted, reusing"
 else
-  # NFSv4 pseudoroot — the itsthenetwork/nfs-server-alpine exports at /
-  # When --slow, mount via the delay proxy on port 2050 instead of direct 2049.
-  MOUNT_OPTS="vers=4,tcp,resvport"
-  if [ "$NFS_PORT" != "2049" ]; then
-    MOUNT_OPTS="vers=4,tcp,resvport,port=$NFS_PORT,mountport=$NFS_PORT"
-  fi
-  if ! sudo mount_nfs -o "$MOUNT_OPTS" "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
-    # Try v3 with portmap
-    MOUNT_OPTS_V3="vers=3,tcp,resvport"
-    [ "$NFS_PORT" != "2049" ] && MOUNT_OPTS_V3="vers=3,tcp,resvport,port=$NFS_PORT"
-    if ! sudo mount_nfs -o "$MOUNT_OPTS_V3" "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
-      fail "Could not mount NFS (port $NFS_PORT). Try manually:"
-      fail "  sudo mount_nfs -o vers=4,tcp,resvport,port=$NFS_PORT 127.0.0.1:/ $NFS_MOUNT"
+  # Always mount via fast direct path (port 2049). Delay is applied AFTER mount.
+  if ! sudo mount_nfs -o vers=4,tcp,resvport "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
+    if ! sudo mount_nfs -o vers=3,tcp,resvport "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
+      fail "Could not mount NFS. Try manually:"
+      fail "  sudo mount_nfs -o vers=4,tcp,resvport 127.0.0.1:/ $NFS_MOUNT"
       exit 1
     fi
   fi
@@ -188,10 +178,30 @@ for i in $(seq 1 "$NUM_CONTAINERS"); do
 done
 log "$STARTED/$NUM_CONTAINERS containers started"
 
-sleep 10  # let I/O build up
+sleep 5  # let I/O start
 
 RUNNING=$(docker ps --filter name=zombie- --format '{{.Names}}' | wc -l | tr -d ' ')
-log "$RUNNING containers running, letting them churn for 10s..."
+log "$RUNNING containers running"
+
+# Apply network degradation AFTER mount and container start — so the mount
+# handshake succeeds fast, but ongoing NFS I/O gets the full latency/loss.
+if [ "$USE_SLOW" = true ]; then
+  NFS_DELAY_MS="${NFS_DELAY_MS:-2000}"
+  NFS_JITTER_MS="${NFS_JITTER_MS:-500}"
+  NFS_LOSS_PCT="${NFS_LOSS_PCT:-20}"
+  log "Applying tc netem to NFS server: ${NFS_DELAY_MS}ms delay, ±${NFS_JITTER_MS}ms, ${NFS_LOSS_PCT}% loss"
+  PREV_CTX="$(docker context show)"
+  docker context use colima >/dev/null 2>&1
+  docker exec zombie-nfs tc qdisc add dev eth0 root netem \
+    delay "${NFS_DELAY_MS}ms" "${NFS_JITTER_MS}ms" loss "${NFS_LOSS_PCT}%" 2>&1 || \
+    warn "tc netem failed (may need --privileged on NFS container)"
+  docker context use "$PREV_CTX" >/dev/null 2>&1
+  log "Letting degraded I/O churn for 15s..."
+  sleep 15
+else
+  log "Letting I/O churn for 10s..."
+  sleep 10
+fi
 
 # --- Kill ---
 
