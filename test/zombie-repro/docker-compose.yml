@@ -39,5 +39,33 @@ services:
       nfs-init:
         condition: service_completed_successfully
 
+  # Traffic shaping proxy — adds latency + packet loss to NFS traffic.
+  # Simulates plakatz over a congested/flaky network.
+  # The NFS server listens on port 2049 inside the compose network.
+  # This proxy sits in front and forwards to the real NFS server with
+  # configurable degradation via tc netem.
+  #
+  # Usage: set NFS_DELAY_MS and NFS_LOSS_PCT env vars, or use defaults.
+  # Profiles: use `docker compose --profile slow up -d` to enable.
+  nfs-delay:
+    image: alpine:latest
+    container_name: zombie-nfs-delay
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    profiles:
+      - slow
+    ports:
+      - "2050:2050"
+    depends_on:
+      - nfs
+    volumes:
+      - ./delay-proxy.sh:/delay-proxy.sh:ro
+    entrypoint: ["/bin/sh", "/delay-proxy.sh"]
+    environment:
+      NFS_DELAY_MS: ${NFS_DELAY_MS:-200}
+      NFS_LOSS_PCT: ${NFS_LOSS_PCT:-5}
+      NFS_JITTER_MS: ${NFS_JITTER_MS:-100}
+
 volumes:
   nfs-data:

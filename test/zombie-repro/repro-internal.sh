@@ -20,6 +20,17 @@ PROFILE="zombie-test"
 NUM_CONTAINERS=5
 KILL_TIMEOUT=15
 NFS_MOUNT="/tmp/zombie-nfs-mount"
+USE_SLOW=false
+NFS_PORT=2049  # default: direct to NFS server
+
+# Parse flags
+for arg in "$@"; do
+  case "$arg" in
+    --slow) USE_SLOW=true; NFS_PORT=2050 ;;
+    --containers=*) NUM_CONTAINERS="${arg#*=}" ;;
+    --timeout=*) KILL_TIMEOUT="${arg#*=}" ;;
+  esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,6 +70,16 @@ if ! docker ps --filter name=zombie-nfs --format '{{.State}}' 2>/dev/null | grep
   exit 1
 fi
 
+if [ "$USE_SLOW" = true ]; then
+  if ! docker ps --filter name=zombie-nfs-delay --format '{{.State}}' 2>/dev/null | grep -q running; then
+    fail "Slow proxy not running. Run: docker compose --profile slow up -d"
+    fail "Or set NFS_DELAY_MS=500 NFS_LOSS_PCT=10 docker compose --profile slow up -d"
+    exit 1
+  fi
+  log "Using SLOW mode: NFS traffic goes through tc netem proxy (port $NFS_PORT)"
+  docker logs zombie-nfs-delay 2>&1 | grep -E 'Adding|Starting' | tail -2
+fi
+
 # Get the colima VM's IP (reachable from inside VZ test profile via host network)
 COLIMA_IP=$(colima list --json 2>/dev/null | grep -o '"address":"[^"]*"' | head -1 | cut -d'"' -f4)
 if [ -z "$COLIMA_IP" ]; then
@@ -80,11 +101,18 @@ if mount | grep -qF "$NFS_MOUNT"; then
   warn "Already mounted, reusing"
 else
   # NFSv4 pseudoroot — the itsthenetwork/nfs-server-alpine exports at /
-  if ! sudo mount_nfs -o vers=4,tcp,resvport "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
+  # When --slow, mount via the delay proxy on port 2050 instead of direct 2049.
+  MOUNT_OPTS="vers=4,tcp,resvport"
+  if [ "$NFS_PORT" != "2049" ]; then
+    MOUNT_OPTS="vers=4,tcp,resvport,port=$NFS_PORT,mountport=$NFS_PORT"
+  fi
+  if ! sudo mount_nfs -o "$MOUNT_OPTS" "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
     # Try v3 with portmap
-    if ! sudo mount_nfs -o vers=3,tcp,resvport "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
-      fail "Could not mount NFS. Try manually:"
-      fail "  sudo mount_nfs -o vers=4,tcp,resvport 127.0.0.1:/ $NFS_MOUNT"
+    MOUNT_OPTS_V3="vers=3,tcp,resvport"
+    [ "$NFS_PORT" != "2049" ] && MOUNT_OPTS_V3="vers=3,tcp,resvport,port=$NFS_PORT"
+    if ! sudo mount_nfs -o "$MOUNT_OPTS_V3" "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
+      fail "Could not mount NFS (port $NFS_PORT). Try manually:"
+      fail "  sudo mount_nfs -o vers=4,tcp,resvport,port=$NFS_PORT 127.0.0.1:/ $NFS_MOUNT"
       exit 1
     fi
   fi
@@ -110,6 +138,14 @@ colima start \
 docker context use "colima-$PROFILE"
 
 # --- Start containers ---
+
+# Capture virtiofs mount options inside the VM for debugging.
+# This is the data we need to compare between lima 1.x and 2.x.
+log "Virtiofs mount info inside VM:"
+docker run --rm -v "$NFS_MOUNT:/data" alpine sh -c \
+  'cat /proc/mounts | grep virtiofs; echo ---; cat /proc/version' 2>&1 | while read -r line; do
+  log "  $line"
+done
 
 log "Starting $NUM_CONTAINERS containers doing I/O on NFS-backed virtiofs..."
 for i in $(seq 1 "$NUM_CONTAINERS"); do
