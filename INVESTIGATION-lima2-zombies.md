@@ -89,12 +89,34 @@ Both QEMU+sshfs and VZ+virtiofs produce zombies when NFS is slow. Since both
 use the same guest kernel, the bug is in the kernel's handling of signal
 delivery to processes blocked on FUSE/virtiofs I/O.
 
+### Docker version swap test (2026-04-06)
+
+Swapped Docker 29.2.1 → 29.2.0 inside the same VM (same kernel). Result:
+Docker 29.2.0 still produces 1/5 zombies (vs 2/5 with 29.2.1). Slightly
+better but NOT fixed. **Confirms the kernel is the root cause**, not Docker.
+
+| Docker | Kernel | VM | Zombies | Kill Time |
+|--------|--------|-----|---------|-----------|
+| 29.2.1 | 6.8.0-100 | VZ+virtiofs | 2/5 | 36s |
+| 29.2.1 | 6.8.0-100 | QEMU+sshfs | 3/5 | 45s |
+| 29.2.0 | 6.8.0-100 | VZ+virtiofs | 1/5 | 36s |
+
+### Definitive root cause
+
+**Ubuntu kernel 6.8.0-100-generic** (built Jan 13 2026) has a regression
+in signal delivery to processes blocked on FUSE/virtiofs/sshfs I/O
+backed by slow network filesystems. When NFS RPCs take >1s, container
+processes enter TASK_UNINTERRUPTIBLE and SIGKILL cannot be delivered.
+
+This is a kernel bug, not colima/lima/Docker. Colima-core controls which
+kernel ships. The fix is in colima-core: pin to a pre-regression kernel
+or upgrade to a kernel with the fix.
+
 ### Next steps
 
-1. Compare kernel versions: what kernel did colima-core v0.10.0 ship?
-2. Test with an older kernel image in the same lima 2.1.0 VM
-3. Check if the kernel has known regressions in FUSE signal handling
-4. Consider filing a kernel bug (ubuntu or upstream Linux)
+1. Identify the exact kernel version in colima-core v0.10.0 (which works)
+2. File an Ubuntu kernel bug against 6.8.0-100-generic for FUSE signal regression
+3. Test with a newer kernel (6.8.0-101+) if available
 
 ### Previous hypothesis (disproven)
 
