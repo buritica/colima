@@ -139,6 +139,10 @@ docker context use "colima-$PROFILE"
 
 # --- Start containers ---
 
+# Pull alpine in the test profile (fresh context has no images).
+log "Pulling alpine image in test profile..."
+docker pull alpine:latest >/dev/null 2>&1
+
 # Capture virtiofs mount options inside the VM for debugging.
 # This is the data we need to compare between lima 1.x and 2.x.
 log "Virtiofs mount info inside VM:"
