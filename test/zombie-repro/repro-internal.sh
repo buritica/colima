@@ -70,12 +70,14 @@ if ! docker ps --filter name=zombie-nfs --format '{{.State}}' 2>/dev/null | grep
 fi
 
 if [ "$USE_SLOW" = true ]; then
-  log "Using SLOW mode: will apply tc netem to NFS server after mount"
-  log "  delay=${NFS_DELAY_MS}ms jitter=${NFS_JITTER_MS}ms loss=${NFS_LOSS_PCT}%"
-  # Ensure iproute2 is installed in the NFS container for tc netem.
   docker context use colima >/dev/null 2>&1
-  docker exec zombie-nfs sh -c 'which tc >/dev/null 2>&1 || apk add --no-cache iproute2 >/dev/null 2>&1' || true
-  docker context use "colima-$PROFILE" >/dev/null 2>&1 || true
+  if ! docker ps --filter name=zombie-nfs-delay --format '{{.State}}' 2>/dev/null | grep -q running; then
+    fail "Slow proxy not running. Start it with:"
+    fail "  NFS_DELAY_MS=1000 NFS_LOSS_PCT=15 docker compose --profile slow up -d"
+    exit 1
+  fi
+  log "Using SLOW mode via tc netem proxy (port 2050)"
+  docker logs zombie-nfs-delay 2>&1 | grep -E 'Adding|Starting' | tail -2
 fi
 
 # Get the colima VM's IP (reachable from inside VZ test profile via host network)
@@ -98,12 +100,26 @@ mkdir -p "$NFS_MOUNT"
 if mount | grep -qF "$NFS_MOUNT"; then
   warn "Already mounted, reusing"
 else
-  # Always mount via fast direct path (port 2049). Delay is applied AFTER mount.
-  if ! sudo mount_nfs -o vers=4,tcp,resvport "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
-    if ! sudo mount_nfs -o vers=3,tcp,resvport "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
-      fail "Could not mount NFS. Try manually:"
-      fail "  sudo mount_nfs -o vers=4,tcp,resvport 127.0.0.1:/ $NFS_MOUNT"
-      exit 1
+  if [ "$USE_SLOW" = true ]; then
+    # Mount via the delay proxy (port 2050). Use soft mount with retries
+    # so the mount handshake can survive the added latency.
+    log "Mounting via slow proxy (port 2050)..."
+    if ! sudo mount_nfs -o vers=4,tcp,resvport,port=2050,mountport=2050,soft,retrans=10,timeo=50 \
+      "127.0.0.1:/" "$NFS_MOUNT" 2>&1; then
+      if ! sudo mount_nfs -o vers=4,tcp,resvport,soft,retrans=10,timeo=50 \
+        "127.0.0.1:/" "$NFS_MOUNT" 2>&1; then
+        fail "Could not mount NFS via slow proxy."
+        fail "Try the fast path first: sudo mount_nfs -o vers=4,tcp,resvport 127.0.0.1:/ $NFS_MOUNT"
+        exit 1
+      fi
+    fi
+  else
+    if ! sudo mount_nfs -o vers=4,tcp,resvport "127.0.0.1:/" "$NFS_MOUNT" 2>/dev/null; then
+      if ! sudo mount_nfs -o vers=3,tcp,resvport "127.0.0.1:/export" "$NFS_MOUNT" 2>/dev/null; then
+        fail "Could not mount NFS. Try manually:"
+        fail "  sudo mount_nfs -o vers=4,tcp,resvport 127.0.0.1:/ $NFS_MOUNT"
+        exit 1
+      fi
     fi
   fi
 fi
@@ -183,21 +199,9 @@ sleep 5  # let I/O start
 RUNNING=$(docker ps --filter name=zombie- --format '{{.Names}}' | wc -l | tr -d ' ')
 log "$RUNNING containers running"
 
-# Apply network degradation AFTER mount and container start — so the mount
-# handshake succeeds fast, but ongoing NFS I/O gets the full latency/loss.
 if [ "$USE_SLOW" = true ]; then
-  NFS_DELAY_MS="${NFS_DELAY_MS:-2000}"
-  NFS_JITTER_MS="${NFS_JITTER_MS:-500}"
-  NFS_LOSS_PCT="${NFS_LOSS_PCT:-20}"
-  log "Applying tc netem to NFS server: ${NFS_DELAY_MS}ms delay, ±${NFS_JITTER_MS}ms, ${NFS_LOSS_PCT}% loss"
-  PREV_CTX="$(docker context show)"
-  docker context use colima >/dev/null 2>&1
-  docker exec zombie-nfs tc qdisc add dev eth0 root netem \
-    delay "${NFS_DELAY_MS}ms" "${NFS_JITTER_MS}ms" loss "${NFS_LOSS_PCT}%" 2>&1 || \
-    warn "tc netem failed (may need --privileged on NFS container)"
-  docker context use "$PREV_CTX" >/dev/null 2>&1
-  log "Letting degraded I/O churn for 15s..."
-  sleep 15
+  log "Letting degraded NFS I/O churn for 20s..."
+  sleep 20
 else
   log "Letting I/O churn for 10s..."
   sleep 10
