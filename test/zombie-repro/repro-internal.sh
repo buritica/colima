@@ -153,6 +153,11 @@ done
 
 log "Starting $NUM_CONTAINERS containers doing I/O on NFS-backed virtiofs..."
 
+# Remove any stale containers from prior crashed runs.
+for i in $(seq 1 "$NUM_CONTAINERS"); do
+  docker rm -f "zombie-$i" >/dev/null 2>&1 || true
+done
+
 # Verify the mount is accessible inside docker before starting the loop.
 if ! docker run --rm -v "$NFS_MOUNT:/data" alpine ls /data/ >/dev/null 2>&1; then
   fail "Cannot access $NFS_MOUNT inside docker. Mount may be stale."
