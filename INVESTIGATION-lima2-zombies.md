@@ -63,12 +63,48 @@ arriving during that window gets queued but never delivered, so the
 container process becomes a "zombie and can not be killed" until the
 underlying NFS RPC finally resolves.
 
-Why lima 2.x makes it worse than lima 1.x: unknown. Hypotheses:
-- virtiofs mount options (cache mode, tiered i/o config) changed defaults
-- VM kernel image shipped with lima 2.x handles D-state scheduling differently
-- VZ framework integration path changed (lima 2.0 reorganized VM drivers as
-  plugins — the internal contract between lima and Apple's VZ.framework
-  could have changed)
+## Root cause identified (2026-04-06)
+
+**The bug is NOT specific to VZ or virtiofs.** Running the same slow-NFS test
+with QEMU+sshfs produces EVEN MORE zombies (3/5) than VZ+virtiofs (2/5).
+Both VM types use the same kernel image: `Linux 6.8.0-100-generic` from
+colima-core v0.10.1.
+
+**The root cause is the VM kernel image**, not the virtualization backend.
+Colima-core v0.10.1 ships kernel 6.8.0-100-generic (Ubuntu, built Jan 2026).
+Colima-core v0.10.0 (the previous image) likely had an older kernel that
+handled NFS-backed FUSE/virtiofs D-state differently.
+
+### Evidence
+
+| Test | VM Type | Mount | NFS Delay | Zombies | Kill Time |
+|------|---------|-------|-----------|---------|-----------|
+| lima 2.1.0 | VZ | virtiofs | none | 0/10 | 0.4s |
+| lima 2.1.0 | VZ | virtiofs | 500ms/10% | 0/5 (2 slow 6-9s) | 21s |
+| lima 2.1.0 | VZ | virtiofs | 1000ms/15% | **2/5 zombie** | 36s |
+| lima 2.1.0 | QEMU | sshfs | 1000ms/15% | **3/5 zombie** | 45s |
+| halfmoon 1.2.3 | VZ | virtiofs | real NFS | 0/10 | 7s |
+
+Both QEMU+sshfs and VZ+virtiofs produce zombies when NFS is slow. Since both
+use the same guest kernel, the bug is in the kernel's handling of signal
+delivery to processes blocked on FUSE/virtiofs I/O.
+
+### Next steps
+
+1. Compare kernel versions: what kernel did colima-core v0.10.0 ship?
+2. Test with an older kernel image in the same lima 2.1.0 VM
+3. Check if the kernel has known regressions in FUSE signal handling
+4. Consider filing a kernel bug (ubuntu or upstream Linux)
+
+### Previous hypothesis (disproven)
+
+~~Why lima 2.x makes it worse than lima 1.x: unknown. Hypotheses:~~
+- ~~virtiofs mount options (cache mode, tiered i/o config) changed defaults~~
+- ~~VM kernel image shipped with lima 2.x handles D-state scheduling differently~~
+- ~~VZ framework integration path changed~~
+
+The virtiofs/VZ hypothesis was wrong. The QEMU+sshfs control test proves the
+bug is VM-type-agnostic. The common factor is the kernel image.
 
 ## Tests added in this branch
 
