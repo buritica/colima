@@ -1,0 +1,43 @@
+# NFS server for zombie-container reproduction.
+#
+# This runs an NFS v3 server in Docker (via crowntail's existing QEMU colima)
+# that exports a share with root_squash and restrictive permissions — the same
+# conditions that trigger the zombie bug on halfmoon.
+#
+# Usage:
+#   docker compose up -d          # start NFS server
+#   ./repro.sh                    # run the reproduction test
+#   docker compose down           # cleanup
+
+services:
+  # Create the restrictive directory structure first, then start NFS.
+  nfs-init:
+    image: alpine:latest
+    container_name: zombie-nfs-init
+    volumes:
+      - nfs-data:/export
+    entrypoint: >
+      sh -c '
+        mkdir -p /export/Media/Movies /export/Media/TV /export/Media/Music &&
+        chown -R 1000:100 /export/Media &&
+        chmod 770 /export/Media/Movies /export/Media/TV /export/Media/Music &&
+        chmod 777 /export/Media &&
+        echo "init done"
+      '
+
+  nfs:
+    image: itsthenetwork/nfs-server-alpine
+    container_name: zombie-nfs
+    privileged: true
+    environment:
+      SHARED_DIRECTORY: "/export"
+    volumes:
+      - nfs-data:/export
+    ports:
+      - "2049:2049"
+    depends_on:
+      nfs-init:
+        condition: service_completed_successfully
+
+volumes:
+  nfs-data:
