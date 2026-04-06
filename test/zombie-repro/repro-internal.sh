@@ -152,23 +152,36 @@ docker run --rm -v "$NFS_MOUNT:/data" alpine sh -c \
 done
 
 log "Starting $NUM_CONTAINERS containers doing I/O on NFS-backed virtiofs..."
+
+# Verify the mount is accessible inside docker before starting the loop.
+if ! docker run --rm -v "$NFS_MOUNT:/data" alpine ls /data/ >/dev/null 2>&1; then
+  fail "Cannot access $NFS_MOUNT inside docker. Mount may be stale."
+  fail "Debug: docker run --rm -v $NFS_MOUNT:/data alpine ls /data/"
+  docker run --rm -v "$NFS_MOUNT:/data" alpine ls /data/ 2>&1 || true
+  exit 1
+fi
+
+STARTED=0
 for i in $(seq 1 "$NUM_CONTAINERS"); do
-  docker run -d \
+  if docker run -d \
     --name "zombie-$i" \
     -v "$NFS_MOUNT:/data" \
     alpine sh -c "
       while true; do
-        # Write to the NFS-backed mount
         echo tick-$i-\$(date +%s) >> /data/log-$i.txt 2>/dev/null
-        # Stat restricted dirs (triggers permission-denied NFS RPCs)
         ls /data/Media/Movies/ >/dev/null 2>&1 || true
         ls /data/Media/TV/ >/dev/null 2>&1 || true
-        # Heavy write
         dd if=/dev/urandom of=/data/junk-$i bs=4k count=50 2>/dev/null
         sleep 0.1
       done
-    " >/dev/null 2>&1
+    " >/dev/null 2>&1; then
+    STARTED=$((STARTED + 1))
+  else
+    warn "Failed to start zombie-$i"
+    docker run -d --name "zombie-$i" -v "$NFS_MOUNT:/data" alpine echo test 2>&1 || true
+  fi
 done
+log "$STARTED/$NUM_CONTAINERS containers started"
 
 sleep 10  # let I/O build up
 
